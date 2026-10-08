@@ -1,0 +1,247 @@
+name: Build KernelSU-Next kernel for Pixel 3 (blueline)
+
+on:
+  # Manual trigger from the Actions UI
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KernelSU-Next branch/tag (use "legacy" for kernels < 4.14)'
+        required: false
+        default: 'legacy'
+      defconfig:
+        description: 'defconfig name'
+        required: false
+        default: 'sdm845_defconfig'
+  # Also allow pushing a no-op commit to kick off a build
+  push:
+    paths:
+      - '.github/workflows/build-kernelsu.yml'
+      - 'README.md'
+
+env:
+  KERNEL_REPO: https://github.com/LineageOS/android_kernel_google_msm-4.9
+  KERNEL_BRANCH: lineage-22.2
+  KERNEL_COMMIT: df5cccf77f2a78959014d9b9206241a128691764
+  CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+  CLANG_BRANCH: lineage-20.0
+  KSU_REPO: https://github.com/KernelSU-Next/KernelSU-Next
+  # workflow_dispatch 时取用户输入；push 触发时 inputs 为空，回退到默认值
+  KSU_REF: ${{ github.event.inputs.ksu_ref || 'legacy' }}
+  DEFCONFIG: ${{ github.event.inputs.defconfig || 'sdm845_defconfig' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h
+
+      - name: Set up Python and install deps
+        run: |
+          sudo apt-get update -y -qq
+          sudo apt-get install -y --no-install-recommends \
+            git bc bison flex libssl-dev libelf-dev zip unzip \
+            ccache python3-pip rsync \
+            build-essential gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            device-tree-compiler android-sdk-libsparse-utils \
+            openssl
+          sudo pip3 install --no-cache-dir --break-system-packages \
+            'urllib3<2' requests
+
+      # Kernel source: shallow clone of the exact commit LineageOS 22.2 used
+      - name: Clone kernel source
+        run: |
+          git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} ${{ env.KERNEL_REPO }} kernel
+          cd kernel
+          # Pin to the exact commit that produced the running kernel (4.9.337-gdf5cccf77f2a)
+          git fetch --depth=1 origin ${{ env.KERNEL_COMMIT }}
+          git checkout -f ${{ env.KERNEL_COMMIT }}
+          git log -1 --oneline
+
+      # Official LineageOS prebuilt clang toolchain (clang-r416183b)
+      - name: Clone prebuilt clang toolchain
+        run: |
+          git clone --depth=1 -b ${{ env.CLANG_BRANCH }} ${{ env.CLANG_REPO }} clang
+          CLANG_BIN=$PWD/clang/bin
+          chmod +x $CLANG_BIN/*
+          $CLANG_BIN/clang --version | head -2
+
+      # KernelSU-Next driver integration.
+      # IMPORTANT for Pixel 3: kernel is 4.9 (< 4.14) -> MUST use the "legacy" branch.
+      - name: Integrate KernelSU-Next driver (legacy branch)
+        run: |
+          cd kernel
+          echo "Kernel tree: $PWD"
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s ${{ env.KSU_REF }}
+          echo "--- KernelSU dir contents ---"
+          ls -la KernelSU/ 2>&1 | head -30
+
+      - name: Verify driver integration
+        run: |
+          cd kernel
+          test -d KernelSU || { echo "::error::KernelSU dir missing - integration failed"; exit 1; }
+          echo "--- files to patch ---"
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
+            if [ -f "$f" ]; then echo "OK  $f"; else echo "MISSING  $f"; fi
+          done
+          echo "--- Kconfig ---"
+          find . -name "Kconfig" -path "*KernelSU*" 2>/dev/null
+
+      # Use the same defconfig LineageOS uses for blueline (sdm845 = Snapdragon 845)
+      - name: Prepare defconfig
+        run: |
+          cd kernel
+          DEFCONFIG=${{ env.DEFCONFIG }}
+          echo "Using defconfig: $DEFCONFIG"
+          if [ ! -f "arch/arm64/configs/$DEFCONFIG" ] && [ ! -f "arch/arm64/configs/vendor/$DEFCONFIG" ]; then
+            echo "::error::defconfig $DEFCONFIG not found"
+            ls arch/arm64/configs/
+            exit 1
+          fi
+          cp arch/arm64/configs/$DEFCONFIG .config 2>/dev/null || \
+          cp arch/arm64/configs/vendor/$DEFCONFIG .config
+
+      - name: Enable KernelSU config
+        run: |
+          cd kernel
+          # Generate out/.config from the defconfig.
+          # Must NOT be silenced: if this fails the whole build would silently
+          # use a wrong/default config.
+          export PATH=$PWD/../clang/bin:$PATH
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make O=out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- ${{ env.DEFCONFIG }} 2>&1 | tail -10
+          test -f out/.config || { echo "::error::out/.config was not generated"; exit 1; }
+
+          # Enable KernelSU via scripts/config
+          for cfg in CONFIG_KSU=y CONFIG_KPROBES=y CONFIG_KPROBE_EVENTS=y CONFIG_KSU_KPROBE_HOOKS=y; do
+            ./scripts/config --file out/.config -e $cfg
+          done
+          make O=out ARCH=arm64 olddefconfig 2>&1 | tail -5
+
+          echo "--- KernelSU related config ---"
+          grep -E "CONFIG_KSU|CONFIG_KPROBE" out/.config | head -20
+          grep -q "^CONFIG_KSU=y" out/.config \
+            || { echo "::error::CONFIG_KSU did not stick - driver integration likely failed"; exit 1; }
+          echo "CONFIG_KSU=y confirmed"
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          max-size: 10G
+          key: ${{ env.DEFCONFIG }}
+
+      - name: Build kernel
+        run: |
+          cd kernel
+          export PATH=$PWD/../clang/bin:$PATH
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_HOST="GitHubActions-blueline"
+          export CCACHE_EXEC=$(which ccache)
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+
+          # Pixel 3 appends the DTB to the kernel image
+          ./scripts/config --file out/.config -e CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE
+          make O=out ARCH=arm64 olddefconfig
+
+          # Parallel build; -k keeps going to surface as many errors as possible
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC="ccache clang" \
+            LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            2>&1 | tee build.log | tail -80
+
+          echo "=== Build artifacts ==="
+          ls -la out/arch/arm64/boot/ 2>&1 || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel/build.log
+          retention-days: 7
+
+      - name: Package boot image
+        id: package
+        run: |
+          cd kernel/out/arch/arm64/boot
+          ls -la
+          IMG=""
+          # Prefer the dtb-appended image for Pixel 3
+          for candidate in Image.gz-dtb Image.lz4-dtb Image-dtb Image.gz Image.lz4 Image; do
+            if [ -f "$candidate" ]; then IMG=$candidate; break; fi
+          done
+          if [ -z "$IMG" ]; then
+            echo "::error::No kernel image produced. Check build-log artifact."
+            exit 1
+          fi
+          echo "Using kernel image: $IMG"
+          cp "$IMG" boot-kernel
+
+          # Pack into a bootable boot.img using magiskboot
+          curl -sSL -o /tmp/magiskboot \
+            https://github.com/topjohnwu/Magisk/releases/download/v27.0/Magisk-v27.0.apk
+          unzip -o /tmp/magiskboot -d /tmp/magisk_tmp 'lib/*/libmagiskboot.so' >/dev/null
+          MB=$(find /tmp/magisk_tmp -name 'libmagiskboot.so' | head -1)
+          mkdir -p /tmp/mb && cp "$MB" /tmp/mb/magiskboot
+          chmod +x /tmp/mb/magiskboot
+
+          # 64MB is the standard Pixel 3 boot partition size
+          truncate -s 64M /tmp/boot.img
+          /tmp/mb/magiskboot compress=xz "$PWD/boot-kernel" /tmp/kernel.xz
+          /tmp/mb/magiskboot add /tmp/boot.img /tmp/kernel.xz
+          cp /tmp/boot.img $GITHUB_WORKSPACE/boot-kernelsu-next-blueline.img
+
+          # Also make an AnyKernel3 flashable zip (recovery-installable)
+          cd $GITHUB_WORKSPACE
+          rm -rf anykernel && mkdir anykernel
+          curl -sSL -o ak3.zip https://github.com/osm0sis/AnyKernel3/archive/refs/heads/master.zip
+          unzip -q ak3.zip -d /tmp/ak3
+          cp -r /tmp/ak3/AnyKernel3-master/* anykernel/
+          rm -f anykernel/tools/* 2>/dev/null || true
+          cp kernel/out/arch/arm64/boot/boot-kernel anykernel/Image.gz-dtb 2>/dev/null || \
+          cp kernel/out/arch/arm64/boot/boot-kernel anykernel/Image.gz
+          rm -f anykernel/ak3.zip
+          (cd anykernel && zip -r9 ../KernelSU-Next-blueline-AnyKernel3.zip ./*)
+          ls -la KernelSU-Next-blueline-AnyKernel3.zip boot-kernelsu-next-blueline.img
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-next-blueline
+          path: |
+            boot-kernelsu-next-blueline.img
+            KernelSU-Next-blueline-AnyKernel3.zip
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          {
+            echo "### KernelSU-Next kernel for Pixel 3 (blueline)"
+            echo ""
+            echo "| Item | Value |"
+            echo "|---|---|"
+            echo "| Kernel branch | ${{ env.KERNEL_BRANCH }} |"
+            echo "| Kernel commit | ${{ env.KERNEL_COMMIT }} |"
+            echo "| defconfig | ${{ env.DEFCONFIG }} |"
+            echo "| KSU ref | ${{ env.KSU_REF }} |"
+            echo "| Toolchain | clang-r416183b |"
+            echo ""
+            echo "Download the artifact below and flash with:"
+            echo '```bash'
+            echo "fastboot flash boot boot-kernelsu-next-blueline.img"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
